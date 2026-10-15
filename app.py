@@ -1,8 +1,9 @@
-"""Attendance Tracker: Flask + Firebase Firestore (Python port of the C++ program).
+"""Attendance Tracker: Flask + Firebase Firestore, with blocks (sections).
 
 Firestore layout (one private space per login):
-  users/{username}/students/{id}      -> {name}
-  users/{username}/attendance/{date}  -> {studentId: "P" | "A" | "L" | "E"}
+  users/{username}/blocks/{blockId}                      -> {name}
+  users/{username}/blocks/{blockId}/students/{id}        -> {name}
+  users/{username}/blocks/{blockId}/attendance/{date}    -> {studentId: "P" | "A" | "L" | "E"}
 """
 import hmac
 import json
@@ -13,7 +14,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from flask import Flask, Response, g, jsonify, request, send_file
 
-from export_xlsx import build_workbook
+from export_xlsx import build_workbook, build_workbook_multi
 from import_xlsx import parse_spreadsheet
 
 app = Flask(__name__, static_folder="static", static_url_path="")
@@ -35,8 +36,12 @@ def init_db():
 db = init_db()
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 NAME_RE = re.compile(r"^[a-z0-9_.-]{1,40}$")
+BID_RE = re.compile(r"^[a-z0-9-]{1,50}$")
+XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+MAX_BLOCKS = 30
 
 
+# ---------------------------------------------------------------- logins
 def load_users():
     """USERS="juan:pass1,maria:pass2" -> {"juan": "pass1", "maria": "pass2"}"""
     users = {}
@@ -56,7 +61,7 @@ SHARED_PASSWORD = os.environ.get("APP_PASSWORD")  # optional: one shared login
 @app.before_request
 def require_login():
     if not USERS and not SHARED_PASSWORD:
-        g.user = "local"  # no login configured (local testing only)
+        g.user = "local"  # no login configured
         return None
     auth = request.authorization
     if auth and auth.username:
@@ -74,68 +79,158 @@ def require_login():
 
 
 def user_doc():
-    """Each user's data lives under users/{username}/..., private to that login."""
     return db.collection("users").document(g.user)
 
 
-@app.get("/")
-def index():
-    return app.send_static_file("index.html")
+def blocks_ref():
+    return user_doc().collection("blocks")
+
+
+# ---------------------------------------------------------------- helpers
+def commit_ops(ops):
+    """ops: [("set", ref, data) | ("delete", ref, None)], in batches (Firestore max 500)."""
+    for i in range(0, len(ops), 400):
+        batch = db.batch()
+        for kind, ref, data in ops[i:i + 400]:
+            batch.set(ref, data) if kind == "set" else batch.delete(ref)
+        batch.commit()
+
+
+def replace_collection(ref, new_docs):
+    """Make the collection exactly equal to new_docs ({doc_id: data})."""
+    old = {d.id: d for d in ref.list_documents()}
+    ops = [("set", ref.document(k), v) for k, v in new_docs.items()]
+    ops += [("delete", old[k], None) for k in old.keys() - new_docs.keys()]
+    commit_ops(ops)
 
 
 def sort_key(s):
     return (0, int(s["id"]), "") if s["id"].isdigit() else (1, 0, s["id"])
 
 
-def load_all():
+def slugify(name):
+    return (re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "block")[:40]
+
+
+def unique_id(name, taken):
+    base, bid, n = slugify(name), slugify(name), 2
+    while bid in taken:
+        bid, n = f"{base}-{n}", n + 1
+    return bid
+
+
+def clean_name(body):
+    name = str((body or {}).get("name", "")).strip()
+    return name if 1 <= len(name) <= 40 else None
+
+
+def list_blocks():
+    docs = list(blocks_ref().stream())
+    if not docs:  # first use: create Block A-E
+        ops = [("set", blocks_ref().document(f"block-{c.lower()}"), {"name": f"Block {c}"})
+               for c in "ABCDE"]
+        first = blocks_ref().document("block-a")  # move older single-class data into Block A
+        for coll in ("students", "attendance"):
+            for d in user_doc().collection(coll).stream():
+                ops.append(("set", first.collection(coll).document(d.id), d.to_dict()))
+                ops.append(("delete", d.reference, None))
+        commit_ops(ops)
+        docs = list(blocks_ref().stream())
+    blocks = [{"id": d.id, "name": d.to_dict().get("name", d.id)} for d in docs]
+    blocks.sort(key=lambda b: b["name"].lower())
+    return blocks
+
+
+def block_ref(bid):
+    if BID_RE.match(bid):
+        ref = blocks_ref().document(bid)
+        if ref.get().exists:
+            return ref
+    return None
+
+
+def load_block(ref):
     students = [{"id": d.id, "name": d.to_dict().get("name", "")}
-                for d in user_doc().collection("students").stream()]
+                for d in ref.collection("students").stream()]
     students.sort(key=sort_key)
-    records = {d.id: d.to_dict() for d in user_doc().collection("attendance").stream()}
+    records = {d.id: d.to_dict() for d in ref.collection("attendance").stream()}
     return students, records
 
 
-@app.get("/api/data")
-def get_data():
-    students, records = load_all()
-    return jsonify(students=students, records=records, user=g.user)
+def not_found():
+    return jsonify(error="Block not found."), 404
 
 
-@app.get("/api/export.xlsx")
-def export_xlsx():
-    students, records = load_all()
-    return send_file(build_workbook(students, records), as_attachment=True,
-                     download_name="attendance.xlsx",
-                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+# ---------------------------------------------------------------- pages / blocks
+@app.get("/")
+def index():
+    return app.send_static_file("index.html")
 
 
-def replace_collection(ref, new_docs):
-    """Make the collection exactly equal to new_docs ({doc_id: data})."""
-    old_ids = {d.id for d in ref.list_documents()}
-    ops = [("set", k, v) for k, v in new_docs.items()]
-    ops += [("delete", k, None) for k in old_ids - new_docs.keys()]
-    for i in range(0, len(ops), 400):  # Firestore batches hold max 500 writes
-        batch = db.batch()
-        for op, k, v in ops[i:i + 400]:
-            batch.set(ref.document(k), v) if op == "set" else batch.delete(ref.document(k))
-        batch.commit()
+@app.get("/api/blocks")
+def get_blocks():
+    return jsonify(user=g.user, blocks=list_blocks())
 
 
-@app.post("/api/parse-import")
-def parse_import():
-    f = request.files.get("file")
-    if not f:
-        return jsonify(error="No file received."), 400
-    try:
-        return jsonify(parse_spreadsheet(f.read(), f.filename or ""))
-    except ValueError as e:
-        return jsonify(error=str(e)), 400
-    except Exception:
-        return jsonify(error="Could not read that file. Please use .xlsx or .csv."), 400
+@app.post("/api/blocks")
+def add_block():
+    name = clean_name(request.get_json(silent=True))
+    if not name:
+        return jsonify(error="Enter a block name (1 to 40 characters)."), 400
+    existing = list_blocks()
+    if len(existing) >= MAX_BLOCKS:
+        return jsonify(error=f"You can have at most {MAX_BLOCKS} blocks."), 400
+    if any(b["name"].lower() == name.lower() for b in existing):
+        return jsonify(error="A block with that name already exists."), 400
+    bid = unique_id(name, {b["id"] for b in existing})
+    blocks_ref().document(bid).set({"name": name})
+    return jsonify(id=bid, name=name)
 
 
-@app.put("/api/data")
-def put_data():
+@app.patch("/api/blocks/<bid>")
+def rename_block(bid):
+    ref = block_ref(bid)
+    if not ref:
+        return not_found()
+    name = clean_name(request.get_json(silent=True))
+    if not name:
+        return jsonify(error="Enter a block name (1 to 40 characters)."), 400
+    if any(b["name"].lower() == name.lower() and b["id"] != bid for b in list_blocks()):
+        return jsonify(error="A block with that name already exists."), 400
+    ref.set({"name": name})
+    return jsonify(id=bid, name=name)
+
+
+@app.delete("/api/blocks/<bid>")
+def delete_block(bid):
+    ref = block_ref(bid)
+    if not ref:
+        return not_found()
+    if len(list_blocks()) <= 1:
+        return jsonify(error="You must keep at least one block."), 400
+    ops = []
+    for coll in ("students", "attendance"):
+        ops += [("delete", d, None) for d in ref.collection(coll).list_documents()]
+    ops.append(("delete", ref, None))
+    commit_ops(ops)
+    return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- block data
+@app.get("/api/blocks/<bid>/data")
+def get_data(bid):
+    ref = block_ref(bid)
+    if not ref:
+        return not_found()
+    students, records = load_block(ref)
+    return jsonify(students=students, records=records)
+
+
+@app.put("/api/blocks/<bid>/data")
+def put_data(bid):
+    ref = block_ref(bid)
+    if not ref:
+        return not_found()
     body = request.get_json(silent=True) or {}
     students, records = body.get("students"), body.get("records")
     if not isinstance(students, list) or not isinstance(records, dict):
@@ -156,9 +251,44 @@ def put_data():
         if clean:
             record_docs[day] = clean
 
-    replace_collection(user_doc().collection("students"), student_docs)
-    replace_collection(user_doc().collection("attendance"), record_docs)
+    replace_collection(ref.collection("students"), student_docs)
+    replace_collection(ref.collection("attendance"), record_docs)
     return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- spreadsheets
+@app.get("/api/blocks/<bid>/export.xlsx")
+def export_block(bid):
+    ref = block_ref(bid)
+    if not ref:
+        return not_found()
+    students, records = load_block(ref)
+    name = ref.get().to_dict().get("name", bid)
+    return send_file(build_workbook(students, records, name), as_attachment=True,
+                     download_name=f"attendance-{bid}.xlsx", mimetype=XLSX)
+
+
+@app.get("/api/export-all.xlsx")
+def export_all():
+    items = []
+    for b in list_blocks():
+        students, records = load_block(blocks_ref().document(b["id"]))
+        items.append((b["name"], students, records))
+    return send_file(build_workbook_multi(items), as_attachment=True,
+                     download_name="attendance-all-blocks.xlsx", mimetype=XLSX)
+
+
+@app.post("/api/parse-import")
+def parse_import():
+    f = request.files.get("file")
+    if not f:
+        return jsonify(error="No file received."), 400
+    try:
+        return jsonify(parse_spreadsheet(f.read(), f.filename or ""))
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    except Exception:
+        return jsonify(error="Could not read that file. Please use .xlsx or .csv."), 400
 
 
 if __name__ == "__main__":

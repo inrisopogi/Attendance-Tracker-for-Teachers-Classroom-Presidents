@@ -48,6 +48,7 @@ input,select{border:1px solid var(--bd);background:var(--card);border-radius:8px
 .name{min-width:0;overflow-wrap:anywhere}
 </style></head><body><main>
 <div class="top"><h1>Attendance Tracker</h1><span class="sync" id="sync"></span></div>
+<div id="blocks"></div>
 <nav id="nav"></nav>
 <div id="view"></div>
 </main>
@@ -65,32 +66,78 @@ function refreshDate(){
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshDate()});
 const esc=t=>String(t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const norm=d=>({students:Array.isArray(d&&d.students)?d.students:[],records:(d&&d.records)||{}});
-try{S=norm(JSON.parse(localStorage.getItem(KEY)||'null'))}catch(e){}
 
-let dirty=false,who='';
+let dirty=false,who='',blocks=[],cur='';
+try{cur=localStorage.getItem('attendance-block')||''}catch(e){}
+const J={'Content-Type':'application/json'};
+const api=(p,o)=>fetch(p,o).then(async r=>{const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||'Request failed');return d});
+const byName=(a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true});
+const curName=()=>(blocks.find(b=>b.id===cur)||{}).name||'';
 function persist(){
-  try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){}
+  const b=cur,snap=JSON.stringify(S);
+  try{localStorage.setItem(KEY+':'+b,snap)}catch(e){}
   dirty=true;sync='Saving…';head();
-  fetch('/api/data',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(S)})
-    .then(r=>{if(!r.ok)throw 0;dirty=false;sync='Synced';head()})
+  fetch('/api/blocks/'+b+'/data',{method:'PUT',headers:J,body:snap})
+    .then(r=>{if(!r.ok)throw 0;if(b===cur){dirty=false;sync='Synced'}head()})
     .catch(()=>{sync='Offline: saved on this device only';head()});
 }
-async function init(){await pull(true)}
-async function pull(first){
-  if(dirty&&!first){persist();return}
+async function init(){
   try{
-    const r=await fetch('/api/data');if(!r.ok)throw 0;
-    const raw=await r.json();who=raw.user||'';const d=norm(raw);
-    if(first&&!d.students.length&&S.students.length)persist();
-    else{S=d;try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){}sync='Synced'}
-  }catch(e){sync='Offline: saved on this device only'}
+    const d=await api('/api/blocks');who=d.user||'';blocks=d.blocks;
+    if(!blocks.some(b=>b.id===cur))cur=blocks[0].id;
+    try{localStorage.setItem('attendance-block',cur)}catch(e){}
+  }catch(e){sync='Offline: could not load blocks';head();return render()}
+  await pull(true);
+}
+async function pull(first){
+  if(!cur)return;
+  if(dirty&&!first){persist();return}
+  const b=cur;
+  try{
+    const d=norm(await api('/api/blocks/'+b+'/data'));
+    if(b!==cur)return;
+    S=d;try{localStorage.setItem(KEY+':'+b,JSON.stringify(S))}catch(e){}
+    sync='Synced';
+  }catch(e){
+    sync='Offline: saved on this device only';
+    try{S=norm(JSON.parse(localStorage.getItem(KEY+':'+b)||'null'))}catch(x){}
+  }
   head();if(tab!=='attendance')render();
+}
+async function setBlock(id){
+  cur=id;dirty=false;S={students:[],records:{}};draft={};q='';sumId='';msg='';
+  try{localStorage.setItem('attendance-block',cur)}catch(e){}
+  render();await pull(true);
+}
+async function newBlock(){
+  const name=(prompt('Name of the new block (example: Block F)')||'').trim();if(!name)return;
+  try{const b=await api('/api/blocks',{method:'POST',headers:J,body:JSON.stringify({name})});blocks.push(b);blocks.sort(byName);await setBlock(b.id)}
+  catch(e){msg=e.message;render()}
+}
+async function renameBlock(){
+  const name=(prompt('New name for this block',curName())||'').trim();if(!name||name===curName())return;
+  try{const b=await api('/api/blocks/'+cur,{method:'PATCH',headers:J,body:JSON.stringify({name})});
+    blocks=blocks.map(x=>x.id===b.id?b:x).sort(byName);msg='Block renamed.';render()}
+  catch(e){msg=e.message;render()}
+}
+async function deleteBlock(){
+  if(blocks.length<2){msg='You must keep at least one block.';return render()}
+  if(!confirm('Delete "'+curName()+'" and all of its students and attendance? This cannot be undone.'))return;
+  try{await api('/api/blocks/'+cur,{method:'DELETE'});blocks=blocks.filter(b=>b.id!==cur);await setBlock(blocks[0].id)}
+  catch(e){msg=e.message;render()}
+}
+function renderBlocks(){
+  const el=$('#blocks');if(!el||!blocks.length)return;
+  el.innerHTML='<div class="card row"><select id="blk" style="flex:1;min-width:140px">'+blocks.map(b=>'<option value="'+esc(b.id)+'"'+(b.id===cur?' selected':'')+'>'+esc(b.name)+'</option>').join('')+'</select><button id="bnew">+ Block</button><button id="bren">Rename</button><button id="bdel" class="del">Delete</button></div>';
+  $('#blk').onchange=e=>setBlock(e.target.value);
+  $('#bnew').onclick=newBlock;$('#bren').onclick=renameBlock;$('#bdel').onclick=deleteBlock;
 }
 window.addEventListener('focus',()=>pull(false));
 
 const sidx=id=>S.students.findIndex(s=>s.id===id);
 const stat=(d,id)=>(S.records[d]||{})[id];
 function head(){
+  renderBlocks();
   $('#sync').textContent=(who?who+' · ':'')+sync;
   const T=[['students','Students'],['attendance','Take'],['daily','Daily'],['summary','Summary']];
   $('#nav').innerHTML=T.map(t=>`<button class="${tab===t[0]?'on':''}" data-t="${t[0]}">${t[1]}</button>`).join('');
@@ -144,8 +191,9 @@ async function importSheet(file){
 }
 function vStudents(){
   const f=S.students.filter(s=>(s.name+' '+s.id).toLowerCase().includes(q.toLowerCase()));
-  return `<div class="card"><div class="row"><input class="id" id="sid" placeholder="ID"><input id="sname" placeholder="Student name"><button class="pri" id="add">Add</button></div></div>
-  <div class="card"><div class="row"><button id="impx" class="pri">Import spreadsheet</button><input type="file" id="filex" accept=".xlsx,.csv" hidden><button id="imp">Import students.txt</button><button id="exp">Download spreadsheet</button><input type="file" id="file" accept=".txt,text/plain" hidden></div></div>
+  return `<p class="mut" style="margin:0 0 8px">Students in <b>${esc(curName())}</b></p>
+  <div class="card"><div class="row"><input class="id" id="sid" placeholder="ID"><input id="sname" placeholder="Student name"><button class="pri" id="add">Add</button></div></div>
+  <div class="card"><div class="row"><button id="impx" class="pri">Import spreadsheet</button><input type="file" id="filex" accept=".xlsx,.csv" hidden><button id="imp">Import students.txt</button><button id="exp">Download this block</button><button id="expall">Download all blocks</button><input type="file" id="file" accept=".txt,text/plain" hidden></div></div>
   <div class="card"><input id="q" placeholder="Search by name or ID" value="${esc(q)}">
   <div class="list" style="margin-top:8px">${f.map(s=>`<div><span class="name"><b>${esc(s.id)}</b> &nbsp;${esc(s.name)}</span><button class="del" data-del="${esc(s.id)}">Remove</button></div>`).join('')||`<p class="mut">${S.students.length?'No student found.':'No students registered.'}</p>`}</div></div>`;
 }
@@ -184,7 +232,8 @@ function render(){
   on('#imp',()=>$('#file').click());
   on('#impx',()=>$('#filex').click());
   const fx=$('#filex');if(fx)fx.onchange=()=>{if(fx.files[0])importSheet(fx.files[0])};
-  on('#exp',()=>{location.href='/api/export.xlsx'});
+  on('#exp',()=>{location.href='/api/blocks/'+cur+'/export.xlsx'});
+  on('#expall',()=>{location.href='/api/export-all.xlsx'});
   const fi=$('#file');if(fi)fi.onchange=()=>{const f=fi.files[0];if(f)f.text().then(importText)};
   on('#allp',()=>{S.students.forEach(s=>draft[s.id]='P');render()});
   V.querySelectorAll('[data-del]').forEach(b=>b.onclick=()=>delStudent(b.dataset.del));

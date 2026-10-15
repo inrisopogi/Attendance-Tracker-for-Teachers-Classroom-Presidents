@@ -1,5 +1,6 @@
-"""Build the attendance spreadsheet (.xlsx) from students and records."""
+"""Build attendance spreadsheets (.xlsx) from students and records."""
 import io
+import re
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -10,12 +11,7 @@ LABELS = [("Present", "P"), ("Absent", "A"), ("Late", "L"), ("Excused", "E")]
 FILLS = {"P": "D9F2E3", "A": "F8D7D7", "L": "FBEBC8", "E": "E3DEF8"}
 
 
-def build_workbook(students, records):
-    """students: [{'id','name'}]; records: {'YYYY-MM-DD': {studentId: 'P'|'A'|'L'|'E'}}."""
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Attendance"
-
+def _fill(ws, students, records):
     dates = sorted(records)
     first_date_col = 8  # A=ID, B=Name, C..F=counts, G=percent, H onward = dates
     headers = ["ID", "Name"] + [l for l, _ in LABELS] + ["Attendance %"] + dates
@@ -58,7 +54,30 @@ def build_workbook(students, records):
         ws.column_dimensions[get_column_letter(c)].width = 12
     ws.freeze_panes = "C2"
 
+
+def _title(name, used):
+    base = (re.sub(r"[\[\]:*?/\\]", "", name).strip() or "Sheet")[:28]
+    t, n = base, 2
+    while t.lower() in used:
+        t, n = f"{base} {n}", n + 1
+    used.add(t.lower())
+    return t
+
+
+def build_workbook_multi(items):
+    """items: [(sheet name, students, records), ...] -> BytesIO with one sheet each."""
+    wb = Workbook()
+    wb.remove(wb.active)
+    used = set()
+    for name, students, records in items:
+        _fill(wb.create_sheet(_title(name, used)), students, records)
+    if not wb.sheetnames:
+        wb.create_sheet("Attendance")
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
     return buf
+
+
+def build_workbook(students, records, name="Attendance"):
+    return build_workbook_multi([(name, students, records)])
